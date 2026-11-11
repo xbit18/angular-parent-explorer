@@ -1,0 +1,75 @@
+{
+  "name": "angular-parent-explorer",
+  "displayName": "Angular Parent Explorer",
+  "description": "Navigate direct standalone Angular component template consumers.",
+  "version": "0.1.0",
+  "publisher": "local-development",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.cjs",
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:html",
+    "onLanguage:scss"
+  ],
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "angularParents",
+          "name": "Angular Parents"
+        }
+      ]
+    },
+    "commands": [
+      { "command": "angularParents.collapseAll", "title": "Collapse All", "icon": "$(collapse-all)" },
+      { "command": "angularParents.expandAll", "title": "Expand All", "icon": "$(expand-all)" },
+      { "command": "angularParents.pin", "title": "Angular Parents: Pin Component", "icon": "$(pin)" },
+      { "command": "angularParents.unpin", "title": "Angular Parents: Unpin Component", "icon": "$(pinned)" },
+      { "command": "angularParents.filter", "title": "Angular Parents: Filter Parents", "icon": "$(search)" },
+      { "command": "angularParents.clearFilter", "title": "Angular Parents: Clear Filter", "icon": "$(clear-all)" },
+      { "command": "angularParents.diagnostics", "title": "Angular Parents: Show Diagnostics", "icon": "$(output)" },
+      {
+        "command": "angularParents.refresh",
+        "title": "Rebuild Index"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "angularParents.collapseAll", "when": "view == angularParents", "group": "more@3" },
+        { "command": "angularParents.expandAll", "when": "view == angularParents", "group": "more@4" },
+        { "command": "angularParents.pin", "when": "view == angularParents && !angularParents.pinned", "group": "navigation@1" },
+        { "command": "angularParents.unpin", "when": "view == angularParents && angularParents.pinned", "group": "navigation@1" },
+        { "command": "angularParents.filter", "when": "view == angularParents", "group": "navigation@2" },
+        { "command": "angularParents.clearFilter", "when": "view == angularParents && angularParents.filtered", "group": "navigation@3" },
+        { "command": "angularParents.diagnostics", "when": "view == angularParents", "group": "more@2" },
+        {
+          "command": "angularParents.refresh",
+          "when": "view == angularParents",
+          "group": "more@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "benchmark": "tsx src/benchmark.ts",
+    "build": "esbuild src/extension.ts src/analysis-worker.ts --bundle --platform=node --format=cjs --external:vscode --outdir=dist --out-extension:.js=.cjs",
+    "check": "tsc --noEmit",
+    "test": "npm run build && tsx --test test/*.test.ts",
+    "vscode:prepublish": "npm run check && npm run build"
+  },
+  "dependencies": {
+    "@angular/compiler": "^21.2.26",
+    "typescript": "~5.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.96.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.19.0"
+  }
+}
