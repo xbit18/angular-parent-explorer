@@ -1,0 +1,10 @@
+**
+!package.json
+!README.md
+!CHANGELOG.md
+!dist/
+!dist/extension.cjs
+!dist/analysis-worker.cjs
+!dist/*.LEGAL.txt
+!notices/
+!notices/**

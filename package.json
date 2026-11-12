@@ -28,11 +28,11 @@
     "commands": [
       { "command": "angularParents.collapseAll", "title": "Collapse All", "icon": "$(collapse-all)" },
       { "command": "angularParents.expandAll", "title": "Expand All", "icon": "$(expand-all)" },
-      { "command": "angularParents.pin", "title": "Angular Parents: Pin Component", "icon": "$(pin)" },
-      { "command": "angularParents.unpin", "title": "Angular Parents: Unpin Component", "icon": "$(pinned)" },
-      { "command": "angularParents.filter", "title": "Angular Parents: Filter Parents", "icon": "$(search)" },
-      { "command": "angularParents.clearFilter", "title": "Angular Parents: Clear Filter", "icon": "$(clear-all)" },
-      { "command": "angularParents.diagnostics", "title": "Angular Parents: Show Diagnostics", "icon": "$(output)" },
+      { "command": "angularParents.pin", "title": "Pin Component", "icon": "$(pin)" },
+      { "command": "angularParents.unpin", "title": "Unpin Component", "icon": "$(pinned)" },
+      { "command": "angularParents.filter", "title": "Filter Parents", "icon": "$(search)" },
+      { "command": "angularParents.clearFilter", "title": "Clear Filter", "icon": "$(clear-all)" },
+      { "command": "angularParents.diagnostics", "title": "Show Diagnostics", "icon": "$(output)" },
       {
         "command": "angularParents.refresh",
         "title": "Rebuild Index"
@@ -56,6 +56,7 @@
     }
   },
   "scripts": {
+    "package:private": "node scripts/prepare-notices.mjs && npx --yes @vscode/vsce@4.1.0 package --no-dependencies --allow-missing-repository --skip-license",
     "benchmark": "tsx src/benchmark.ts",
     "build": "esbuild src/extension.ts src/analysis-worker.ts --bundle --platform=node --format=cjs --external:vscode --outdir=dist --out-extension:.js=.cjs",
     "check": "tsc --noEmit",

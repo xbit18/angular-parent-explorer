@@ -54,5 +54,15 @@ test('native parent expansion commands preserve occurrence selection, pin and fi
     assert.match(String(provider.getChildren()[0]), /match the filter/);
     provider.clearFilter();
     assert.equal(provider.getChildren(parent).length, 1);
+    const internal = provider as unknown as { result: { warnings: string[] } };
+    internal.result.warnings.push(`${f('parent.ts')}: unsupported metadata`, `${f('other.ts')}: unrelated warning`);
+    const view = { title: '', description: '', message: '' };
+    provider.view = view as typeof provider.view;
+    provider.refreshView();
+    assert.doesNotMatch(view.message, /missing|Diagnostics|incomplete/);
+    assert.ok(provider.getChildren().every(entry => typeof entry !== 'string'), 'diagnostics do not appear among parents');
+    internal.result.warnings.splice(0, internal.result.warnings.length, `${f('other.ts')}: unrelated warning`);
+    provider.refreshView();
+    assert.doesNotMatch(view.message, /missing|Workspace|incomplete/);
   } finally { provider.dispose(); }
 });

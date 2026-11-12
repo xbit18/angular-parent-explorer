@@ -21,13 +21,24 @@ function location(starts: number[], offset: number): [number, number] {
 
 async function handle(request: Request): Promise<Reply> {
   try {
-    if (request.initial) files.clear();
-    for (const file of request.deleted) files.delete(file);
-    for (const [file, source] of request.changes) files.set(file, source);
+    const report = (messages: string[]): void => { parentPort?.postMessage({ id: request.id, progress: { kind: 'progress', messages } }); };
     if (request.storageFile !== storagePath) {
       storagePath = request.storageFile;
       storage = storagePath ? new IndexStorage(storagePath) : undefined;
     }
+    if (request.provisional) {
+      const restored = request.manifest && await storage?.loadProvisional(request.manifest);
+      if (!restored) throw new Error('Provisional cache unavailable; reading workspace files');
+      const cached = [...restored.analysis.information.map(info => `[cached info] ${info}`),
+        ...restored.analysis.warnings.map(warning => `[cached incomplete] ${warning}`)];
+      if (cached.length) report(cached);
+      const snapshot = memorySnapshot();
+      return { id: request.id, result: { ...restored, restored: true, provisional: true,
+        files: request.manifest!.size, analysisMs: 0, before: snapshot, after: snapshot } };
+    }
+    if (request.initial) files.clear();
+    for (const file of request.deleted) files.delete(file);
+    for (const [file, source] of request.changes) files.set(file, source);
     if (request.rebuild) { cache.metadata.clear(); cache.templates.clear(); }
     const before = memorySnapshot();
     const start = performance.now();
@@ -37,7 +48,12 @@ async function handle(request: Request): Promise<Reply> {
       try { restored = await storage.load(files); }
       catch (error) { diskError = String(error); }
     }
-    const analysis = restored ?? analyze(files, cache);
+    if (restored) {
+      const cached = [...restored.information.map(info => `[cached info] ${info}`),
+        ...restored.warnings.map(warning => `[cached incomplete] ${warning}`)];
+      if (cached.length) report(cached);
+    }
+    const analysis = restored ?? analyze(files, cache, report);
     const lines = new Map<string, number[]>();
     const locations: Location[] = analysis.uses.map(use => {
       let starts = lines.get(use.file);
@@ -59,7 +75,7 @@ async function handle(request: Request): Promise<Reply> {
     const analysisMs = performance.now() - start;
     const after = memorySnapshot();
     if (!restored && storage) {
-      try { await storage.save(files, analysis); }
+      try { await storage.save(files, analysis, request.manifest); }
       catch (error) { diskError = String(error); }
     }
     return { id: request.id, result: { analysis: compact, locations, restored: !!restored,

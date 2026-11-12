@@ -39,7 +39,7 @@ test('rejects edited, added, deleted, moved, malformed and old cached inputs', (
   const encoded = encodeIndex(files, analyze(files));
   assert.equal(decodeIndex('broken JSON', files), undefined);
   assert.equal(decodeIndex('{}', files), undefined);
-  const old = JSON.parse(encoded); old.payload = old.payload.replace('1:', '-1:');
+  const old = JSON.parse(encoded); old.payload = old.payload.replace('2:', '-1:');
   assert.equal(decodeIndex(JSON.stringify(old), files), undefined);
   for (const changed of [new Map([...files, [parent, 'changed']]), new Map([...files, [path.resolve('new.json'), '{}']]),
     new Map([[file, files.get(file)!]]), new Map([...files].map(([f, text]) => [f + '.moved', text]))]) {
@@ -49,6 +49,31 @@ test('rejects edited, added, deleted, moved, malformed and old cached inputs', (
   assert.ok(decodeIndex(encoded, new Map([...files].reverse())));
   const corrupt = JSON.parse(encoded); corrupt.payload = corrupt.payload.replace('Parent', 'Changed');
   assert.equal(decodeIndex(JSON.stringify(corrupt), files), undefined);
+});
+
+test('external stylesheet ownership survives exact and provisional cache restoration', async () => {
+  const files = fixture();
+  files.set(parent, files.get(parent)!.replace("imports:[Child]", "styleUrl:'./parent.scss',styleUrls:['./extra.css'],imports:[Child]"));
+  const result = analyze(files);
+  const manifest = new Map([...files].map(([name, text]) => [name, { size: Buffer.byteLength(text), mtime: 1 }]));
+  const encoded = encodeIndex(files, result, manifest);
+  const exact = decodeIndex(encoded, files);
+  assert.ok(exact, 'stylesheet ownership must not invalidate the cache');
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'angular-parent-styles-'));
+  try {
+    const cacheFile = path.join(directory, 'index.json');
+    await writeFile(cacheFile, encoded);
+    const provisional = await new IndexStorage(cacheFile).loadProvisional(manifest);
+    assert.ok(provisional);
+    for (const restored of [exact, provisional.analysis]) {
+      assert.deepEqual(restored.components.find(c => c.name === 'Parent')!.files,
+        result.components.find(c => c.name === 'Parent')!.files);
+      assert.equal(restored.uses.length, 1);
+      assert.equal(restored.uses[0].offset, result.uses[0].offset);
+    }
+    const missingSource = new Map(manifest); missingSource.delete(parent);
+    assert.equal(await new IndexStorage(cacheFile).loadProvisional(missingSource), undefined);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test('persists ordered snapshots across instances, handles missing/corrupt cache and rejects failed writes', async () => {
@@ -73,5 +98,30 @@ test('persists ordered snapshots across instances, handles missing/corrupt cache
     assert.equal(await reopened.load(changed), undefined);
     await reopened.save(first, analyze(first));
     assert.equal((await reopened.load(first))!.uses.length, 1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('provisional manifest enforces inventory and metadata, preserves exact stored positions, rejects old and corrupt envelopes', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'angular-parent-manifest-'));
+  const files = fixture();
+  const manifest = new Map([...files].map(([name, text]) => [name, { size: Buffer.byteLength(text), mtime: 17 }]));
+  const storageFile = path.join(directory, 'index.json');
+  const storage = new IndexStorage(storageFile);
+  try {
+    await storage.save(files, analyze(files), manifest);
+    const cached = await storage.loadProvisional(manifest);
+    assert.equal(cached?.analysis.uses.length, 1);
+    const offset = cached!.analysis.uses[0].offset;
+    assert.deepEqual(cached?.locations[0].start, [0, offset]);
+    for (const changed of [new Map([...manifest, [path.join(directory, 'added.ts'), { size: 1, mtime: 17 }]]),
+      new Map([[file, manifest.get(file)!]]),
+      new Map([...manifest].map(([name, stamp]) => [name, { ...stamp, mtime: 19 }])),
+      new Map([...manifest].map(([name, stamp]) => [name, { ...stamp, size: stamp.size + 1 }]))]) {
+      assert.equal(await storage.loadProvisional(changed), undefined);
+    }
+    await writeFile(storageFile, 'corrupt');
+    assert.equal(await storage.loadProvisional(manifest), undefined);
+    await storage.save(files, analyze(files));
+    assert.equal(await storage.loadProvisional(manifest), undefined, 'legacy/no-manifest snapshot falls back');
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

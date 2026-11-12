@@ -33,7 +33,7 @@ export class AnalysisCache {
 }
 
 /** Static standalone subset. Unsupported metadata is reported, never evaluated. */
-export function analyze(files: Map<string, string>, cache = new AnalysisCache()): Analysis {
+export function analyze(files: Map<string, string>, cache = new AnalysisCache(), report?: (messages: string[]) => void): Analysis {
   const components: Component[] = [];
   const warnings: string[] = [];
   const information: string[] = [];
@@ -46,7 +46,12 @@ export function analyze(files: Map<string, string>, cache = new AnalysisCache())
     const previous = cache.metadata.get(file);
     const external = signature([inventory, resolutionKey, previous?.components.map(c => [c.templateFile, files.get(c.templateFile)]) ?? []]);
     if (previous?.text === text && previous.external === external) {
-      components.push(...previous.components); warnings.push(...previous.warnings); information.push(...previous.information); continue;
+      components.push(...previous.components); warnings.push(...previous.warnings); information.push(...previous.information);
+      if (previous.information.length || previous.warnings.length) report?.([
+        ...previous.information.map(info => `[cached info] ${info}`),
+        ...previous.warnings.map(warning => `[cached incomplete] ${warning}`),
+      ]);
+      continue;
     }
     const componentStart = components.length;
     const warningStart = warnings.length;
@@ -105,7 +110,7 @@ export function analyze(files: Map<string, string>, cache = new AnalysisCache())
               const module = ts.isIdentifier(entry) ? modules.get(entry.text) : undefined;
               // These framework imports cannot re-export workspace components.
               if (module === '@angular/common' || module === '@angular/forms' || module === '@angular/router') {
-                information.push(`${file}: framework dependency ${name} (${module}); excluded from workspace component matching`);
+                information.push(`${file}: imported framework dependency ${name} (${module}); excluded from workspace component matching`);
               } else if (module && !module.startsWith('.') && !module.startsWith('@/')) {
                 warnings.push(`${file}: uninspected external dependency ${name} (${module}); component scope may be incomplete`);
               } else warnings.push(`${file}: unresolved local import ${name}; component scope may be incomplete`);
@@ -127,6 +132,9 @@ export function analyze(files: Map<string, string>, cache = new AnalysisCache())
     const extracted = components.slice(componentStart);
     cache.metadata.set(file, { text, external: signature([inventory, resolutionKey, extracted.map(c => [c.templateFile, files.get(c.templateFile)])]),
       components: extracted, warnings: warnings.slice(warningStart), information: information.slice(informationStart) });
+    const batch = [...information.slice(informationStart).map(info => `[info] ${info}`),
+      ...warnings.slice(warningStart).map(warning => `[incomplete] ${warning}`)];
+    if (batch.length) report?.(batch);
   }
   const uses: Use[] = [];
   const byId = new Map(components.map(c => [c.id, c]));
@@ -134,7 +142,11 @@ export function analyze(files: Map<string, string>, cache = new AnalysisCache())
   for (const parent of components) {
     const key = signature([parent, parent.imports.map(id => byId.get(id))]);
     const previous = cache.templates.get(parent.id);
-    if (previous?.key === key) { uses.push(...previous.uses); warnings.push(...previous.warnings); continue; }
+    if (previous?.key === key) {
+      uses.push(...previous.uses); warnings.push(...previous.warnings);
+      if (previous.warnings.length) report?.(previous.warnings.map(warning => `[cached incomplete] ${warning}`));
+      continue;
+    }
     const useStart = uses.length;
     const warningStart = warnings.length;
     const matcher = new SelectorMatcher<Component>();
@@ -146,7 +158,12 @@ export function analyze(files: Map<string, string>, cache = new AnalysisCache())
       }
     }
     const parsed = parseTemplate(parent.template, parent.templateFile);
-    if (parsed.errors?.length) { warnings.push(`${parent.templateFile}: template parse errors`); continue; }
+    if (parsed.errors?.length) {
+      const warning = `${parent.templateFile}: template parse errors`;
+      warnings.push(warning);
+      report?.([`[incomplete] ${warning}`]);
+      continue;
+    }
     const visit = (nodes: readonly any[]): void => {
       for (const node of nodes) {
         if (typeof node.name === 'string' && node.startSourceSpan) {
@@ -171,6 +188,7 @@ export function analyze(files: Map<string, string>, cache = new AnalysisCache())
     };
     visit(parsed.nodes);
     cache.templates.set(parent.id, { key, uses: uses.slice(useStart), warnings: warnings.slice(warningStart) });
+    if (warnings.length > warningStart) report?.(warnings.slice(warningStart).map(warning => `[incomplete] ${warning}`));
   }
   return { components, uses, warnings, information };
 }

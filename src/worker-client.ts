@@ -1,13 +1,14 @@
 import { Worker } from 'node:worker_threads';
-import type { Reply, Request, WorkerResult } from './worker-protocol';
+import type { Progress, Reply, Request, WorkerResult } from './worker-protocol';
+import type { Manifest } from './index-storage';
 
-interface Waiter { resolve: (result: WorkerResult) => void; reject: (error: Error) => void }
+interface Waiter { resolve: (result: WorkerResult) => void; reject: (error: Error) => void; progress?: (event: Progress) => void }
 
 export class WorkerClient {
   private readonly worker: Worker;
   private nextId = 0;
   private active?: { id: number; waiters: Waiter[] };
-  private queued?: { changes: Map<string, string>; deleted: Set<string>; initial: boolean; rebuild: boolean; waiters: Waiter[] };
+  private queued?: { changes: Map<string, string>; deleted: Set<string>; initial: boolean; rebuild: boolean; manifest?: Manifest; provisional: boolean; waiters: Waiter[] };
   private failure?: Error;
 
   constructor(entry: string, private readonly storageFile?: string) {
@@ -15,6 +16,10 @@ export class WorkerClient {
     this.worker.on('message', (reply: Reply) => {
       if (this.failure || reply.id !== this.active?.id) return;
       const current = this.active;
+      if ('progress' in reply) {
+        current.waiters.forEach(waiter => waiter.progress?.(reply.progress));
+        return;
+      }
       this.active = undefined;
       if ('error' in reply) current.waiters.forEach(waiter => waiter.reject(new Error(reply.error)));
       else current.waiters.forEach(waiter => waiter.resolve(reply.result));
@@ -24,15 +29,19 @@ export class WorkerClient {
     this.worker.on('exit', code => this.fail(new Error(`Analysis worker exited (${code})`)));
   }
 
-  submit(changes: Map<string, string>, deleted: string[], initial: boolean, rebuild = false): Promise<WorkerResult> {
+  submit(changes: Map<string, string>, deleted: string[], initial: boolean, rebuild = false,
+    manifest?: Manifest, provisional = false, progress?: (event: Progress) => void): Promise<WorkerResult> {
     if (this.failure) return Promise.reject(this.failure);
     return new Promise<WorkerResult>((resolve, reject) => {
-      if (!this.queued || initial) this.queued = { changes: new Map(), deleted: new Set(), initial, rebuild, waiters: this.queued?.waiters ?? [] };
+      if (!this.queued || initial) this.queued = { changes: new Map(), deleted: new Set(), initial, rebuild,
+        manifest, provisional, waiters: this.queued?.waiters ?? [] };
       const pending = this.queued;
       pending.rebuild ||= rebuild;
+      pending.manifest = manifest;
+      pending.provisional = provisional;
       for (const file of deleted) { pending.changes.delete(file); pending.deleted.add(file); }
       for (const [file, text] of changes) { pending.deleted.delete(file); pending.changes.set(file, text); }
-      pending.waiters.push({ resolve, reject });
+      pending.waiters.push({ resolve, reject, progress });
       this.flush();
     });
   }
@@ -44,7 +53,8 @@ export class WorkerClient {
     const id = ++this.nextId;
     this.active = { id, waiters: pending.waiters };
     const request: Request = { id, changes: pending.changes, deleted: [...pending.deleted],
-      initial: pending.initial, rebuild: pending.rebuild, storageFile: this.storageFile };
+      initial: pending.initial, rebuild: pending.rebuild, storageFile: this.storageFile,
+      manifest: pending.manifest, provisional: pending.provisional };
     try { this.worker.postMessage(request); }
     catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))); }
   }

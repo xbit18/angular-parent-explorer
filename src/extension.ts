@@ -5,6 +5,7 @@ import { formatDuration, ViewState } from './view-state';
 import { formatMemory } from './memory';
 import { WorkerClient } from './worker-client';
 import type { Location, WorkerResult } from './worker-protocol';
+import type { Manifest } from './index-storage';
 
 type Entry = Component | Use | string;
 export class Parents implements vscode.TreeDataProvider<Entry>, vscode.Disposable {
@@ -53,6 +54,7 @@ export class Parents implements vscode.TreeDataProvider<Entry>, vscode.Disposabl
   private timer?: ReturnType<typeof setTimeout>;
   private revision = 0;
   private busy = false;
+  private verifying = false;
   private error?: string;
   private readonly output = vscode.window.createOutputChannel('Angular Parents');
 
@@ -60,11 +62,12 @@ export class Parents implements vscode.TreeDataProvider<Entry>, vscode.Disposabl
   refreshView(): void {
     if (this.view) {
       const owners = this.owners();
-      this.view.title = owners.length === 1 ? `${owners[0].name} · Used by` : 'Angular Parents';
+      this.view.title = owners.length === 1 ? owners[0].name : 'Angular Parents';
       const uses = owners.length === 1 ? this.consumers.get(owners[0].id) ?? [] : [];
-      this.view.description = `${this.state.pinnedId ? 'Pinned · ' : ''}${this.busy ? 'Updating…' : this.error ? 'Index unavailable' : `Ready · ${formatDuration(this.duration)}`}`;
+      this.view.description = `${this.state.pinnedId ? 'Pinned · ' : ''}${this.verifying ? 'Verifying…' : this.busy ? 'Updating…' : this.error ? 'Index unavailable' : `Ready · ${formatDuration(this.duration)}`}`;
       this.view.message = [owners.length === 1 ? `${new Set(uses.map(use => use.parent.id)).size} parents · ${uses.length} occurrences` : '',
-        this.state.filter ? `Filter: ${this.state.filter}` : ''].filter(Boolean).join('\n') || undefined;
+        this.state.filter ? `Filter: ${this.state.filter}` : '',
+        this.error ? 'Index update failed. Previous results shown; see Show Diagnostics.' : ''].filter(Boolean).join('\n') || undefined;
     }
     this.changed.fire();
   }
@@ -98,32 +101,95 @@ export class Parents implements vscode.TreeDataProvider<Entry>, vscode.Disposabl
     if (this.disposed) return;
     const started = performance.now();
     const revision = ++this.revision;
-    this.busy = true; this.error = undefined; this.refreshView();
+    const current = (): boolean => revision === this.revision && !this.disposed;
+    const log = (message: string): void => { if (current()) this.output.appendLine(message); };
+    const phase = (label: string): (() => void) => {
+      log(`${label}: begin`);
+      const start = performance.now();
+      return () => log(`${label}: end (${formatDuration(performance.now() - start)})`);
+    };
+    const diagnostics = new Set<string>();
+    const progress = ({ messages }: { messages: string[] }): void => {
+      for (const message of messages) {
+        // A provisional restore and exact validation may report the same diagnostic.
+        const key = message.replace(/^\[cached (info|incomplete)\]/, '[$1]');
+        if (!diagnostics.has(key)) { diagnostics.add(key); log(message); }
+      }
+    };
+    this.busy = true; this.verifying = false; this.error = undefined; this.refreshView();
     try {
-      const uris = await vscode.workspace.findFiles('**/*.{ts,html,json}', '**/{node_modules,dist,out,coverage,.git}/**');
+      const endDiscovery = phase('File discovery');
+      let uris: vscode.Uri[];
+      try { uris = await vscode.workspace.findFiles('**/*.{ts,html,json}', '**/{node_modules,dist,out,coverage,.git}/**'); }
+      finally { endDiscovery(); }
+      const manifest: Manifest = new Map();
+      if (useDisk && !rebuild) {
+        const endManifest = phase('Manifest collection');
+        try {
+          let cursor = 0;
+          let failed: unknown;
+          // Bound outstanding metadata operations; all started workers settle before fallback.
+          await Promise.all(Array.from({ length: Math.min(8, uris.length) }, async () => {
+            while (cursor < uris.length && !failed) {
+              const uri = uris[cursor++];
+              try {
+                const stat = await vscode.workspace.fs.stat(uri);
+                manifest.set(uri.fsPath, { size: stat.size, mtime: stat.mtime });
+              } catch (error) { failed = error; }
+            }
+          }));
+          if (failed) throw failed;
+          endManifest();
+          if (current() && !this.initialized && !vscode.workspace.textDocuments.some(doc =>
+            uris.some(uri => uri.toString() === doc.uri.toString()) && doc.isDirty)) {
+            const endProvisional = phase('Provisional cache request (including worker startup/queue)');
+            try {
+              const cached = await this.worker.submit(new Map(), [], true, false, manifest, true, progress);
+              endProvisional();
+              if (current()) {
+                log(`First results published (not browser paint): ${formatDuration(performance.now() - started)}`);
+                this.publish(cached, performance.now() - started, 'Provisional summary');
+                this.verifying = true; this.busy = true; this.refreshView();
+              }
+            } catch (error) {
+              endProvisional();
+              log(`Provisional cache skipped: ${String(error)}. Reading workspace files.`);
+            }
+          }
+        } catch (error) {
+          endManifest();
+          log(`Workspace metadata unavailable: ${String(error)}. Reading workspace files.`);
+          manifest.clear();
+        }
+      }
+      const endRead = phase('Workspace read/validation');
       const next = new Map<string, string>();
       const listed = new Set(uris.map(uri => uri.fsPath));
-      for (const uri of uris) {
-        if (this.initialized && !rebuild && this.known.has(uri.fsPath) && !this.pending.has(uri.fsPath)) continue;
-        const open = vscode.workspace.textDocuments.find(d => d.uri.toString() === uri.toString());
-        next.set(uri.fsPath, open ? open.getText() : new TextDecoder().decode(await vscode.workspace.fs.readFile(uri)));
-      }
-      if (revision !== this.revision) { this.scheduleScan(); return; }
+      try {
+        for (const uri of uris) {
+          if (this.initialized && !rebuild && this.known.has(uri.fsPath) && !this.pending.has(uri.fsPath)) continue;
+          const open = vscode.workspace.textDocuments.find(d => d.uri.toString() === uri.toString());
+          next.set(uri.fsPath, open ? open.getText() : new TextDecoder().decode(await vscode.workspace.fs.readFile(uri)));
+        }
+      } finally { endRead(); }
+      if (revision !== this.revision || this.disposed) return;
       for (const [file, text] of this.pending) {
         if (text === undefined || !listed.has(file)) next.delete(file);
         else next.set(file, text);
       }
       const removed = [...this.known].filter(file => !listed.has(file));
       this.pending.clear();
-      const result = await this.worker.submit(next, removed, !this.initialized, rebuild || (!useDisk && !this.initialized));
+      const endAnalysis = phase('Worker analysis/exact restore');
+      const result = await this.worker.submit(next, removed, !this.initialized, rebuild || (!useDisk && !this.initialized),
+        manifest.size === uris.length ? manifest : undefined, false, progress).finally(endAnalysis);
       if (revision !== this.revision || this.disposed) return;
       this.initialized = true;
       this.known.clear(); for (const file of listed) this.known.add(file);
-      this.publish(result, performance.now() - started - result.analysisMs);
+      this.publish(result, performance.now() - started - result.analysisMs, 'Final summary');
     } catch (error) {
-      if (revision === this.revision) { this.error = String(error); this.output.appendLine(this.error); }
+      if (revision === this.revision && !this.disposed) { this.error = String(error); this.output.appendLine(`Exact validation failed: ${this.error}. Rebuild Index to retry.`); }
     } finally {
-      if (revision === this.revision) { this.busy = false; this.refreshView(); }
+      if (revision === this.revision && !this.disposed) { this.verifying = false; this.busy = false; this.refreshView(); }
     }
   }
   scheduleScan(): void {
@@ -144,16 +210,23 @@ export class Parents implements vscode.TreeDataProvider<Entry>, vscode.Disposabl
     this.pending.clear();
     if (!changes.size && !deleted.length) { this.busy = false; this.refreshView(); return; }
     try {
-      const result = await this.worker.submit(changes, deleted, false);
+      const diagnostics = new Set<string>();
+      const result = await this.worker.submit(changes, deleted, false, false, undefined, false, ({ messages }) => {
+        if (revision !== this.revision || this.disposed) return;
+        for (const message of messages) {
+          if (diagnostics.has(message)) continue;
+          diagnostics.add(message); this.output.appendLine(message);
+        }
+      });
       if (revision !== this.revision || this.disposed) return;
       for (const file of deleted) this.known.delete(file);
       for (const file of changes.keys()) this.known.add(file);
-      this.publish(result, 0);
+      this.publish(result, 0, 'Final summary');
     } catch (error) {
       if (revision === this.revision && !this.disposed) { this.error = String(error); this.output.appendLine(this.error); }
     } finally { if (revision === this.revision && !this.disposed) { this.busy = false; this.refreshView(); } }
   }
-  private publish(result: WorkerResult, readMs: number): void {
+  private publish(result: WorkerResult, readMs: number, summary: string): void {
       this.result = result.analysis;
       this.locations = result.locations;
       this.consumers.clear();
@@ -162,17 +235,16 @@ export class Parents implements vscode.TreeDataProvider<Entry>, vscode.Disposabl
         uses.push(use); this.consumers.set(use.child.id, uses);
       }
       this.error = undefined;
-      this.output.clear();
+      this.output.appendLine(`${summary}:`);
       this.output.appendLine(`Memory before analysis/restore (process RSS; worker heap): ${formatMemory(result.before)}`);
       this.output.appendLine(`Memory after analysis/restore (process RSS; worker heap): ${formatMemory(result.after)}`);
       this.output.appendLine('RSS is shared by all threads; worker heap is local. Samples are not peaks or extension-only attribution.');
       this.duration = Math.max(0, readMs) + result.analysisMs;
       this.output.appendLine(`Index: ${result.files} files, ${this.result.components.length} components, ${this.result.uses.length} occurrences`);
       this.output.appendLine(`Read/validation: ${formatDuration(Math.max(0, readMs))}; analysis: ${formatDuration(result.analysisMs)}; total: ${formatDuration(this.duration)}`);
-      this.output.appendLine(result.restored ? 'Disk index: reused after exact content validation.' : 'Disk index: live analysis (cache missing, changed, bypassed or unavailable).');
+      this.output.appendLine(result.provisional ? 'Disk index: provisional; exact content validation pending.' :
+        result.restored ? 'Disk index: reused after exact content validation.' : 'Disk index: live analysis (cache missing, changed, bypassed or unavailable).');
       if (result.diskError) this.output.appendLine(`Disk cache unavailable: ${result.diskError}`);
-      for (const info of this.result.information) this.output.appendLine(`[info] ${info}`);
-      for (const warning of this.result.warnings) this.output.appendLine(`[incomplete] ${warning}`);
     this.busy = false; this.refreshView();
   }
   getChildren(entry?: Entry): Entry[] {
@@ -189,14 +261,8 @@ export class Parents implements vscode.TreeDataProvider<Entry>, vscode.Disposabl
         'Open a standalone component, template or stylesheet.'];
     if (owners.length > 1) return ['Shared file: open the component TypeScript file to choose its owner.'];
     const parents = new Map((this.consumers.get(owners[0].id) ?? []).map(use => [use.parent.id, use.parent]));
-    const relevant = this.state.contextualWarnings(this.result.warnings, owners[0], [...parents.values()]);
     const entries: Entry[] = [...parents.values()].filter(parent => this.state.matches(parent.name)).sort((a, b) => a.name.localeCompare(b.name));
-    if (!entries.length) entries.push(parents.size ? 'No parent components match the filter.' : relevant.length ?
-      'No resolved direct parents. Related analysis is incomplete; results may be missing.' : `No resolved direct parents for ${owners[0].name}.`);
-    if (relevant.length) entries.push(`Related analysis: ${relevant.length} incomplete cases. Open diagnostics.`);
-    const other = this.result.warnings.length - relevant.length;
-    if (other) entries.push(`Workspace: ${other} other incomplete cases; not attributed to this component. Open diagnostics.`);
-    if (this.error) entries.push('Index update failed. Previous results shown; open diagnostics.');
+    if (!entries.length) entries.push(parents.size ? 'No parent components match the filter.' : 'No direct parents found.');
     return entries;
   }
   private owners(): Component[] {
